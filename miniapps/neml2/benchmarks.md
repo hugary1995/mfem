@@ -144,29 +144,32 @@ iterations pay off as the problem hardens/grows.)
 ### Coarse AMG: BoomerAMG vs GAMG (combo #2 vs #3), CPU, KSP its over 2 steps
 
 Both matrix-free fine + FGMRES + Chebyshev; only the assembled-coarse AMG differs.
-GAMG here is smoothed aggregation **without** an explicit rigid-body near-null-space
-(a documented follow-up — see below).
+GAMG's rigid-body near-null-space is a toggle (`--near-null-space` / `-nns`,
+default on; the 6 modes are projected as coarse `ParGridFunction`s, orthonormalized
+into true-dof vectors, and set via `MatSetNearNullSpace`).
 
-| model | c2 BoomerAMG (tuned) | c3 GAMG (no near-null-space) |
-|-------|---------------------|-----------------------------|
-| elasticity     |  24 |  28 |
-| j2 (umax 0.02) | 294 | **251** |
-| chaboche       |  70 |  69 |
+| model | c2 BoomerAMG (tuned) | c3 GAMG, no NNS | c3 GAMG + NNS |
+|-------|---------------------|-----------------|---------------|
+| elasticity     |  24 |  28 | **22** |
+| j2 (umax 0.02) | 294 | **251** | 311 |
+| chaboche       |  70 |  69 | 75 |
 
-GAMG's smoothed aggregation is competitive-to-better than tuned BoomerAMG even
-without the near-null-space (j2 251 vs 294). Attaching the 6 rigid-body modes (the
-ordering-safe way: project them as coarse `ParGridFunction`s via
-`VectorFunctionCoefficient`, orthonormalize the true-dof vectors, `MatSetNearNullSpace`
-on the coarse Mat) is expected to widen GAMG's edge for elasticity/j2; it is the
-main remaining refinement for combo #3.
+The rigid-body near-null-space **helps elasticity** (28→22, best of any coarse
+solver) but is **neutral-to-worse for plasticity** (j2 251→311). Physically:
+rigid-body modes are the exact near-kernel of the *elastic* operator, but the
+plastic consistent tangent's near-kernel differs, so an elasticity-oriented coarse
+space isn't optimal there. So NNS is a per-problem knob, not always-on: enable it
+for (near-)elastic responses, disable it for developed plasticity.
 
 ### Findings
 
 - **Tuned BoomerAMG + FGMRES cuts KSP iterations** vs untuned CG: j2 420→294
   (−30%), chaboche 85→70 (−18%); elasticity already trivial (22→24).
 - **GAMG (SA) is competitive-to-better than tuned BoomerAMG** on the coarse level
-  even without a near-null-space (j2 251 vs 294; chaboche 69 vs 70) — a promising
-  coarse solver once rigid-body modes are added.
+  (j2 251 vs 294; chaboche 69 vs 70) — a strong coarse solver.
+- **Rigid-body near-null-space helps elasticity, not plasticity**: elasticity
+  28→22, but j2 251→311 — the elastic near-kernel is the wrong low-energy space for
+  a developed plastic tangent. A knob to sweep per problem, not a default win.
 - **Where the linear solve actually costs**: for j2 the linear work (~6–9 s) is
   comparable to the constitutive cost (~7 s), so preconditioner quality moves
   wall-clock. For chaboche the constitutive cost dominates (~83–86 %), so KSP

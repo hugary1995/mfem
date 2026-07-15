@@ -59,7 +59,70 @@ struct SolverConfig
    std::string coarse = "boomeramg";     // boomeramg | gamg | none
    std::string coarse_mode = "inner-cg"; // inner-cg | vcycle
    bool tuned_amg = false;               // plasticity-tuned scalar BoomerAMG params
+   bool near_null_space = true;          // rigid-body near-null-space for GAMG
 };
+
+// Attach the 6 rigid-body modes (3 translations + 3 rotations) as the near-null
+// space of the assembled coarse operator, so PETSc GAMG's smoothed aggregation
+// builds good elasticity coarse spaces. Ordering-safe (works for byNODES): each
+// mode is projected as a coarse ParGridFunction from a VectorFunctionCoefficient
+// of the nodal coordinates, restricted to the true dofs, zeroed on essential
+// dofs, then orthonormalized. The MatNullSpace references the vectors and the Mat
+// references the null space, so both outlive the local handles here.
+static void AttachRigidBodyNullSpace(ParFiniteElementSpace &fes,
+                                     const Array<int> &ess_tdofs,
+                                     PetscParMatrix &A)
+{
+   constexpr int nrbm = 6;
+   const MPI_Comm comm = fes.GetComm();
+
+   std::vector<Vector> modes(nrbm);
+   ParGridFunction gf(&fes);
+   for (int m = 0; m < nrbm; ++m)
+   {
+      VectorFunctionCoefficient c(3, [m](const Vector &x, Vector &v)
+      {
+         v = 0.0;
+         switch (m)
+         {
+            case 0: v(0) = 1.0; break;                 // translation x
+            case 1: v(1) = 1.0; break;                 // translation y
+            case 2: v(2) = 1.0; break;                 // translation z
+            case 3: v(1) = -x(2); v(2) = x(1); break;  // rotation about x
+            case 4: v(0) = x(2); v(2) = -x(0); break;  // rotation about y
+            case 5: v(0) = -x(1); v(1) = x(0); break;  // rotation about z
+         }
+      });
+      gf.ProjectCoefficient(c);
+      modes[m].SetSize(fes.GetTrueVSize());
+      gf.GetTrueDofs(modes[m]);
+      modes[m].SetSubVector(ess_tdofs, 0.0);
+   }
+
+   // Modified Gram-Schmidt (MatNullSpaceCreate assumes orthonormal vectors).
+   for (int m = 0; m < nrbm; ++m)
+   {
+      for (int k = 0; k < m; ++k)
+      {
+         modes[m].Add(-InnerProduct(comm, modes[m], modes[k]), modes[k]);
+      }
+      const real_t nrm = std::sqrt(InnerProduct(comm, modes[m], modes[m]));
+      if (nrm > 1e-14) { modes[m] *= 1.0 / nrm; }
+   }
+
+   std::vector<std::unique_ptr<PetscParVector>> holders;
+   Array<Vec> vecs(nrbm);
+   for (int m = 0; m < nrbm; ++m)
+   {
+      holders.push_back(std::make_unique<PetscParVector>(comm, modes[m], true));
+      vecs[m] = *holders.back();
+   }
+   MatNullSpace sp;
+   PetscCallAbort(comm,
+                  MatNullSpaceCreate(comm, PETSC_FALSE, nrbm, vecs.GetData(), &sp));
+   PetscCallAbort(comm, MatSetNearNullSpace(A, sp));
+   PetscCallAbort(comm, MatNullSpaceDestroy(&sp));
+}
 
 // I think we're going to have duplicate nonlinear forms on the fine level but maybe that's fine?
 class NEML2Multigrid : public GeometricMultigrid
@@ -174,9 +237,14 @@ class NEML2Multigrid : public GeometricMultigrid
          // PETSc GAMG (smoothed aggregation) on the assembled coarse operator;
          // the fine level stays matrix-free. PC options come from the "coarse_"
          // prefix set in main (-coarse_pc_type gamg). One V-cycle as a fixed
-         // (linear) coarse solve. NOTE: the rigid-body near-null-space that makes
-         // SA-AMG shine for solids is a documented follow-up (see benchmarks.md).
+         // (linear) coarse solve. The 6 rigid-body modes are attached as the
+         // near-null-space so SA-AMG coarsens the elasticity operator well.
          coarse_pmat = new PetscParMatrix(hypreCoarseMat, Operator::PETSC_MATAIJ);
+         if (cfg.near_null_space)
+         {
+            AttachRigidBodyNullSpace(coarse_fespace, *essentialTrueDofs[0],
+                                     *coarse_pmat);
+         }
          coarse_pc = new PetscPreconditioner(*coarse_pmat, "coarse_");
          AddLevel(hypreCoarseMat, coarse_pc, false, false);
          return;
@@ -430,6 +498,10 @@ int main(int argc, char *argv[])
    args.AddOption(&cfg.tuned_amg, "-tamg", "--tuned-amg", "-no-tamg",
                   "--no-tuned-amg",
                   "Apply plasticity-tuned scalar BoomerAMG parameters.");
+   args.AddOption(&cfg.near_null_space, "-nns", "--near-null-space", "-no-nns",
+                  "--no-near-null-space",
+                  "Attach the 6 rigid-body modes as the GAMG coarse near-null-"
+                  "space (helps elasticity; often neutral/worse for plasticity).");
    args.ParseCheck();
 
    // Enable hardware devices such as GPUs, and programming models such as CUDA
