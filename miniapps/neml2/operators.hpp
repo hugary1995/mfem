@@ -23,14 +23,42 @@ class NEML2StressDivergenceIntegrator
    /**
    * @brief Construct a new Linear Momentum Balance object
    *
-   * @param fe_space Finite element space for the displacements
-  *  @param time Current simulation time
+   * @param constit Shared, model-agnostic NEML2 constitutive wrapper (built once
+   *                and shared across the top-level form and every multigrid level)
+   * @param time Current simulation time
    * @param ir Integration rule for the quadrature
-   * @param cmodel NEML2 constitutive model for the material
    */
    NEML2StressDivergenceIntegrator(
-      std::shared_ptr<neml2::aoti::DispatchedModel> cmodel, real_t time,
+      std::shared_ptr<const ConstitutiveModel> constit, real_t time,
       const IntegrationRule *ir = nullptr);
+
+   /// Set the current simulation time (updated once per load step).
+   void SetTime(real_t time) { _t = time; }
+
+   /// Set the (non-owning) per-quadrature-point history store this integrator
+   /// evaluates against. Must be set before any residual/gradient evaluation.
+   /// The converged strain and stress are staged into it automatically during
+   /// residual/gradient evaluation (see ConstitutiveModel::CaptureState).
+   void SetState(MaterialStateManager *state) { _state = state; }
+
+   /// @name Constitutive timing (process-wide, across all integrator instances)
+   ///
+   /// Isolate the NEML2 constitutive cost -- the return-map `forward` (residual)
+   /// and `jacobian` (tangent) solves -- from the surrounding linear algebra, so
+   /// a solver comparison is not confounded by the (solver-independent) plasticity
+   /// cost. Accumulated in static members so every level and every preconditioner
+   /// rebuild contributes. When profiling is on, a device sync brackets each timed
+   /// region for accurate GPU numbers (this serializes, so leave it off for
+   /// production timing of the total). The matrix-free tangent apply (`M:dstrain`)
+   /// is pure linear algebra and is intentionally not counted here.
+   ///@{
+   static void SetProfiling(bool profile) { s_profile = profile; }
+   static void ResetConstitutiveTimers() { s_residual_time = s_tangent_time = 0.0; }
+   /// Wall time (s) spent in NEML2 residual (`forward`) evaluations.
+   static real_t ResidualConstitutiveTime() { return s_residual_time; }
+   /// Wall time (s) spent in NEML2 tangent (`jacobian`) evaluations.
+   static real_t TangentConstitutiveTime() { return s_tangent_time; }
+   ///@}
 
    using StressDivergenceIntegrator<NonlinearFormIntegrator>::AssemblePA;
    void AssemblePA(const FiniteElementSpace &fes) override;
@@ -63,7 +91,16 @@ class NEML2StressDivergenceIntegrator
    void ComputeRImpl(const ParameterFunction &stress, Vector &R) const;
 
  private:
-   const real_t _t;
+   real_t _t;
+
+   /// Non-owning per-quadrature-point history store for this integrator's level
+   /// (owned by main, persistent across preconditioner rebuilds).
+   MaterialStateManager *_state = nullptr;
+
+   /// Constitutive timing accumulators (see the profiling API above).
+   static bool s_profile;
+   static real_t s_residual_time;
+   static real_t s_tangent_time;
 
    /// The quadrature space for symmetric 2nd order tensors
    std::unique_ptr<UniformParameterSpace> _q_space_symr2;
@@ -83,8 +120,15 @@ class NEML2StressDivergenceIntegrator
    /// jacobian at the linearization strain; used by the assembled paths.
    std::optional<at::Tensor> _tangent;
 
-   /// The NEML2 constitutive model wrapped with MFEM APIs
-   const ConstitutiveModel _constit_op;
+   /// The same tangent as the raw SR2->SR2 Mandel 6x6 block, shape (*B,6,6) or
+   /// (6,6). Cached once per linearization (AssembleGradPA) and contracted with
+   /// the strain increment by the matrix-free gradient action (AddMultGradPA), so
+   /// each operator apply is a cheap 6x6 matvec instead of re-running the NEML2
+   /// constitutive solve.
+   std::optional<at::Tensor> _mandel_tangent;
+
+   /// The model-agnostic NEML2 constitutive wrapper (shared, read-only).
+   std::shared_ptr<const ConstitutiveModel> _constit_op;
 
    void ComputeStrain(const Vector &X, ParameterFunction &strain) const;
    void ComputeR(const ParameterFunction &stress, Vector &R) const;

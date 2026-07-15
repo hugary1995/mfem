@@ -1,2 +1,5 @@
 # Compiled NEML2 AOTI artifacts produced by `neml2-compile --output-dir <name>_aoti`
 *_aoti/
+
+# ParaView output written by the miniapp
+neml2-output/

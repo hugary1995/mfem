@@ -37,6 +37,13 @@ if(MFEM_USE_MPI AND neml2_FOUND)
   # Ensure transitively-needed shared libs (e.g. libgomp) are kept
   target_link_options(neml2 PRIVATE -Wl,--no-as-needed)
 
+  # Direct PETSc headers for solver introspection (SNES iteration counts) and the
+  # GAMG coarse path (near-null-space). MFEM wraps PETSc types in mfem::petsc and
+  # does not export the include dir, so add it explicitly.
+  if(PETSC_INCLUDES)
+    target_include_directories(neml2 PRIVATE ${PETSC_INCLUDES})
+  endif()
+
   # Add parallel tests.
   if(MFEM_ENABLE_TESTING)
     add_test(NAME neml2_np=${MFEM_MPI_NP}

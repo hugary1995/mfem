@@ -15,11 +15,24 @@
 namespace mfem
 {
 
+bool NEML2StressDivergenceIntegrator::s_profile = false;
+real_t NEML2StressDivergenceIntegrator::s_residual_time = 0.0;
+real_t NEML2StressDivergenceIntegrator::s_tangent_time = 0.0;
+
+// Sync the device so host wall-clock timing captures async GPU work. No-op on CPU
+// runs (and compiles to nothing when MFEM is built without a GPU backend).
+static inline void DeviceSyncIfGPU()
+{
+#ifdef MFEM_DEVICE_SYNC
+   if (Device::Allows(Backend::DEVICE_MASK)) { MFEM_DEVICE_SYNC; }
+#endif
+}
+
 NEML2StressDivergenceIntegrator::NEML2StressDivergenceIntegrator(
-   std::shared_ptr<neml2::aoti::DispatchedModel> cmodel, real_t time,
+   std::shared_ptr<const ConstitutiveModel> constit, real_t time,
    const IntegrationRule *ir)
     : StressDivergenceIntegrator<NonlinearFormIntegrator>(ir), _t(time),
-      _constit_op(cmodel)
+      _constit_op(std::move(constit))
 {
 }
 
@@ -120,11 +133,11 @@ void NEML2StressDivergenceIntegrator::ComputeStrain(const Vector &X,
 {
    if (this->vdim == 2)
    {
-      this->ComputeStrainImpl<2>(X, *_strain);
+      this->ComputeStrainImpl<2>(X, strain);
    }
    else if (this->vdim == 3)
    {
-      this->ComputeStrainImpl<3>(X, *_strain);
+      this->ComputeStrainImpl<3>(X, strain);
    }
 }
 
@@ -226,11 +239,26 @@ void NEML2StressDivergenceIntegrator::ComputeR(const ParameterFunction &stress,
 void NEML2StressDivergenceIntegrator::AddMultPA(const Vector &X,
                                                 Vector &R) const
 {
+   MFEM_VERIFY(_state, "NEML2StressDivergenceIntegrator: SetState() not called");
+
    // displacement -> strain
    this->ComputeStrain(X, *_strain);
 
-   // strain -> stress via NEML2
-   _constit_op.Mult(*_strain, *_stress, _t);
+   // strain -> stress via NEML2 (reads old history, stages new state)
+   if (s_profile)
+   {
+      StopWatch sw;
+      DeviceSyncIfGPU();
+      sw.Start();
+      _constit_op->Mult(*_strain, *_stress, _t, *_state);
+      DeviceSyncIfGPU();
+      sw.Stop();
+      s_residual_time += sw.RealTime();
+   }
+   else
+   {
+      _constit_op->Mult(*_strain, *_stress, _t, *_state);
+   }
 
    // stress -> residuals
    this->ComputeR(*_stress, R);
@@ -242,16 +270,37 @@ void NEML2StressDivergenceIntegrator::AssembleGradPA(const Vector &X,
    // Make sure our basis functions, geometric factors, and other data is already initialized
    this->AssemblePA(fes);
 
-   // Store the linearization strain (consumed matrix-free by the jvp gradient
-   // action in AddMultGradPA) and evaluate the full tangent for the assembled
-   // paths (PA diagonal, element assembly, coarse hypre matrix).
-   // displacement -> strain
+   MFEM_VERIFY(_state, "NEML2StressDivergenceIntegrator: SetState() not called");
+
+   // Evaluate the consistent tangent once at this linearization strain and cache
+   // it in two forms sharing the single NEML2 solve: the Mandel 6x6 block (used
+   // by the matrix-free gradient action in AddMultGradPA) and the full C_ijkl
+   // (used by the assembled paths: PA diagonal, element assembly, coarse matrix).
    this->ComputeStrain(X, *_strain_lin);
    if (!_tangent.has_value())
    {
       _tangent.emplace();
    }
-   _constit_op.Tangent(*_strain_lin, _tangent.value(), _t);
+   if (!_mandel_tangent.has_value())
+   {
+      _mandel_tangent.emplace();
+   }
+   if (s_profile)
+   {
+      StopWatch sw;
+      DeviceSyncIfGPU();
+      sw.Start();
+      _constit_op->Tangent(*_strain_lin, _mandel_tangent.value(),
+                           _tangent.value(), _t, *_state);
+      DeviceSyncIfGPU();
+      sw.Stop();
+      s_tangent_time += sw.RealTime();
+   }
+   else
+   {
+      _constit_op->Tangent(*_strain_lin, _mandel_tangent.value(),
+                           _tangent.value(), _t, *_state);
+   }
 }
 
 template <int vdim>
@@ -527,11 +576,15 @@ void NEML2StressDivergenceIntegrator::AssembleGradEA(const Vector &X,
 void NEML2StressDivergenceIntegrator::AddMultGradPA(const Vector &dX,
                                                     Vector &dR) const
 {
+   MFEM_VERIFY(_mandel_tangent.has_value(),
+               "AssembleGradPA must run before AddMultGradPA");
+
    // dε = strain_op(dX)
    this->ComputeStrain(dX, *_strain);
 
-   // dσ = C(ε) : dε  (matrix-free jvp at the stored linearization strain)
-   _constit_op.ApplyTangent(*_strain_lin, *_strain, *_stress, _t);
+   // dσ = C : dε  (contract the tangent cached at this linearization -- a 6x6
+   // Mandel matvec per qp, no constitutive re-evaluation)
+   _constit_op->ApplyStoredTangent(_mandel_tangent.value(), *_strain, *_stress);
 
    // dR = stressdiv_op(dσ)
    this->ComputeR(*_stress, dR);
