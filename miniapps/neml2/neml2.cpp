@@ -130,6 +130,69 @@ static void AttachRigidBodyNullSpace(ParFiniteElementSpace &fes,
    PetscCallAbort(comm, MatNullSpaceDestroy(&sp));
 }
 
+/// @brief Restrict a *solution* (a linearization point) from one level to the next
+/// coarser one, as the column-sum-normalized transpose of the unconstrained
+/// prolongation.
+///
+/// This is deliberately not `GeometricMultigrid::prolongations[level]`'s
+/// `MultTranspose`, which is the restriction for residuals. Two separate things
+/// make that one wrong for a solution:
+///
+/// - It sums where it should average. The column sums of a nodal interpolation
+///   run from 1 at a corner to 8 in the interior of a 3D patch, so `P^T` inflates
+///   the interior of a displacement field by up to 8x.
+/// - `GeometricMultigrid` wraps every prolongation in a
+///   RectangularConstrainedOperator, which zeroes the essential true dofs on both
+///   sides. That is right for a correction, which vanishes there, but it discards
+///   the prescribed boundary displacement outright: at the first Newton iterate,
+///   where `u` is nonzero only on the loaded face, `P^T u` is identically zero.
+///
+/// Together they hand the coarse level a state the fine level never visits -- an
+/// interior stretched several-fold against a boundary pinned at zero. A
+/// preconditioner does not have to be consistent to be valid, but this is far
+/// enough outside the fine level's trajectory to drive the local return map past
+/// its radius of convergence: under an n=8 power-law slip rule the constitutive
+/// residual grows as the 8th power of the overshoot.
+///
+/// Normalizing the *unconstrained* transpose fixes both. Every coarse dof
+/// coincides with a fine node where its own basis function is 1, so the weight is
+/// >= 1 and never zero, and each coarse value becomes a convex combination of the
+/// fine values around it -- exact for a constant field, never amplifying, and
+/// carrying the boundary data across.
+static void RestrictSolution(const Operator &P, const Vector &fine,
+                             Vector &coarse, MPI_Comm comm, int level)
+{
+   Vector ones(P.Height()), weights(P.Width());
+   ones.UseDevice(true);
+   weights.UseDevice(true);
+   coarse.UseDevice(true);
+   ones = 1.0;
+   P.MultTranspose(ones, weights);
+   P.MultTranspose(fine, coarse);
+   coarse /= weights;
+
+   if (!getenv("NEML2_MG_DEBUG")) { return; }
+
+   // Device-aware throughout, and read back with explicit host reads: an earlier
+   // version of this probe handed host scratch to a device operator and reported
+   // uninitialized values alongside plausible ones.
+   weights.HostRead();
+   coarse.HostRead();
+   real_t loc[4] = {fine.Normlinf(), coarse.Normlinf(), weights.Max(),
+                    -weights.Min()};
+   real_t glb[4];
+   MPI_Allreduce(loc, glb, 4, MPITypeMap<real_t>::mpi_type, MPI_MAX, comm);
+
+   int rank;
+   MPI_Comm_rank(comm, &rank);
+   if (rank != 0) { return; }
+   std::cout << "    [mg] restrict L" << (level + 1) << " -> L" << level
+             << ": |u_fine|inf=" << glb[0] << " |u_coarse|inf=" << glb[1]
+             << " (x" << (glb[0] > 0 ? glb[1] / glb[0] : 0.0)
+             << ")  weights in [" << -glb[3] << ", " << glb[2] << "]"
+             << std::endl;
+}
+
 // I think we're going to have duplicate nonlinear forms on the fine level but maybe that's fine?
 class NEML2Multigrid : public GeometricMultigrid
 {
@@ -176,19 +239,16 @@ class NEML2Multigrid : public GeometricMultigrid
       coarser_solutions.resize(num_coarser_levels);
       if (num_coarser_levels)
       {
-         // NOTE: this transfers the linearization point down the hierarchy with
-         // P^T, which is the restriction for residuals rather than for
-         // solutions. Coarse levels consequently linearize somewhere the fine
-         // level never visits -- see the "coarse-level linearization point"
-         // entry in physics/cpfe/PLAN.md, which is an open investigation, not a
-         // settled diagnosis.
-         auto create_coarser_solution = [this](const int level,
-                                               const Vector &finer_solution)
+         auto create_coarser_solution = [this, &fespaces](
+                                           const int level,
+                                           const Vector &finer_solution)
          {
             auto &coarse_solution = coarser_solutions[level];
             coarse_solution.SetSize(pnlfs[level].Height());
-            prolongations[level]->MultTranspose(finer_solution,
-                                                coarse_solution);
+            RestrictSolution(*fespaces.GetProlongationAtLevel(level),
+                             finer_solution, coarse_solution,
+                             fespaces.GetFESpaceAtLevel(level).GetComm(),
+                             level);
          };
          create_coarser_solution(num_coarser_levels - 1, fine_solution);
          for (int level = num_coarser_levels - 2; level >= 0; --level)
@@ -939,12 +999,23 @@ int main(int argc, char *argv[])
       top_integ->SetTime(t_n);
       pre_factory->SetTime(t_n);
 
-      // Ramp the prescribed displacement, carrying the previous interior
-      // solution as the initial guess.
+      // Ramp the prescribed displacement, predicting the initial guess by scaling
+      // the whole previous solution by the load ratio.
+      //
+      // The loading here is exactly proportional (one face fixed, the other
+      // ramped), so this reproduces the new Dirichlet data exactly while keeping
+      // the field smooth. Advancing only the boundary against a lagging interior
+      // -- the obvious alternative -- opens a step-sized jump across the first
+      // element at the loaded face, worth several times the physical strain: at
+      // step 2 of `-nt 3 -umax 0.001` it puts max|F - I| at 4.1e-3 where the
+      // converged step is 9.2e-4. That is a discretization artifact, but a local
+      // return map under an n=8 power-law slip rule does not know that, and it
+      // starts far enough out to exhaust its iteration budget.
       const real_t ux = umax * real_t(step) / real_t(nt);
       ug(0) = ux;
       VectorConstantCoefficient prescribed_disp(ug);
       u.SetFromTrueVector();
+      if (step > 1) { u *= real_t(step) / real_t(step - 1); }
       u.ProjectBdrCoefficient(zero_disp, fixed_bnd);
       u.ProjectBdrCoefficient(prescribed_disp, displaced_bnd);
       u.SetTrueVector();

@@ -437,6 +437,30 @@ void NEML2StressDivergenceIntegrator::ComputeDivergence(const ParameterFunction 
    }
 }
 
+// Diagnostic (NEML2_MG_DEBUG=1): the kinematic range the model is about to be
+// evaluated at. `nqp` identifies the multigrid level, since each level carries
+// its own quadrature count. Worth having because a NEML2 return-map failure
+// aborts the process without saying what it was handed, and the interesting
+// question is almost always whether that input was physical.
+static void ReportKinematics(const char *what, real_t t,
+                             const std::vector<ParameterFunction *> &kin,
+                             const ConstitutiveModel &constit)
+{
+   if (!getenv("NEML2_MG_DEBUG") || Mpi::WorldRank() != 0) { return; }
+   const auto opts = constit.Options();
+   for (size_t i = 0; i < kin.size(); ++i)
+   {
+      const at::Tensor v = ConstitutiveModel::Wrap(opts, *kin[i]);
+      const at::Tensor dev =
+         constit.Mode() == KinematicMode::DeformationGradient
+            ? v.reshape({-1, 3, 3}) - at::eye(3, opts)
+            : v;
+      std::cout << "    [kin] " << what << " t=" << t << " nqp=" << v.size(0)
+                << " max|" << constit.KinematicVars()[i].name
+                << " dev|=" << dev.abs().max().item<double>() << std::endl;
+   }
+}
+
 void NEML2StressDivergenceIntegrator::AddMultPA(const Vector &X,
                                                 Vector &R) const
 {
@@ -444,6 +468,7 @@ void NEML2StressDivergenceIntegrator::AddMultPA(const Vector &X,
 
    // displacement -> kinematics
    this->ComputeKinematics(X, _kin);
+   ReportKinematics("residual", _t, _kin_ptrs, *_constit_op);
 
    // kinematics -> stress via NEML2 (reads old history, stages new state)
    if (s_profile)
@@ -479,6 +504,7 @@ void NEML2StressDivergenceIntegrator::AssembleGradPA(const Vector &X,
    // assembled paths: PA diagonal, element assembly, coarse matrix) and its
    // (9,9) flattening (used by the matrix-free gradient action).
    this->ComputeKinematics(X, _kin_lin);
+   ReportKinematics("tangent ", _t, _kin_lin_ptrs, *_constit_op);
    std::vector<at::Tensor> blocks;
    if (s_profile)
    {
