@@ -11,6 +11,7 @@
 
 #include "operators.hpp"
 #include <ATen/ATen.h>
+#include <cmath>
 
 namespace mfem
 {
@@ -28,12 +29,95 @@ static inline void DeviceSyncIfGPU()
 #endif
 }
 
+// NEML2's Mandel SR2 packing [xx, yy, zz, sqrt2 yz, sqrt2 xz, sqrt2 xy]: the flat
+// index of component (i,j), and the sqrt(2) weight carried by each flat index.
+static constexpr int kMandel[3][3] = {{0, 5, 4}, {5, 1, 3}, {4, 3, 2}};
+static inline real_t MandelWeight(int a)
+{
+   return a < 3 ? real_t(1) : std::sqrt(real_t(2));
+}
+
+// Expand a batched Mandel SR2 (*B,6) into a full symmetric (*B,3,3).
+static at::Tensor MandelVecToFull(const at::Tensor &v)
+{
+   using namespace at::indexing;
+   std::vector<int64_t> shape(v.sizes().begin(), v.sizes().end() - 1);
+   shape.insert(shape.end(), {3, 3});
+   at::Tensor out = at::empty(shape, v.options());
+   for (int i = 0; i < 3; ++i)
+      for (int j = 0; j < 3; ++j)
+      {
+         const int a = kMandel[i][j];
+         out.index_put_({Ellipsis, i, j}, v.index({Ellipsis, a}) / MandelWeight(a));
+      }
+   return out;
+}
+
+// Expand the leading Mandel index of a batched dS/dF block (*B,6,3,3) into a
+// symmetric (M,J) pair, giving A_MJkL = dS_MJ/dF_kL with shape (*B,3,3,3,3).
+static at::Tensor MandelRowsToFull(const at::Tensor &b)
+{
+   using namespace at::indexing;
+   std::vector<int64_t> shape(b.sizes().begin(), b.sizes().end() - 3);
+   shape.insert(shape.end(), {3, 3, 3, 3});
+   at::Tensor out = at::empty(shape, b.options());
+   for (int i = 0; i < 3; ++i)
+      for (int j = 0; j < 3; ++j)
+      {
+         const int a = kMandel[i][j];
+         out.index_put_({Ellipsis, i, j, Slice(), Slice()},
+                        b.index({Ellipsis, a, Slice(), Slice()}) /
+                           MandelWeight(a));
+      }
+   return out;
+}
+
+// Assemble the total-Lagrangian tangent D_iJkL = dP_iJ/dF_kL from the model's
+// material block, splitting into the two standard contributions:
+//
+//   geometric: delta_ik S_JL          (stress carried along by the rotation and
+//                                      stretch of the reference gradient)
+//   material:  F_iM dS_MJ/dF_kL       (the constitutive response proper)
+//
+// The result is non-symmetric in general, which is why the assembled kernels
+// contract it in an explicit index order rather than exploiting major symmetry.
+static at::Tensor DeformationGradientTangent(const at::Tensor &dSdF,
+                                             const at::Tensor &S,
+                                             const at::Tensor &F)
+{
+   MFEM_VERIFY(dSdF.dim() == 4,
+               "Expected a batched dS/dF block of shape (nqp,6,3,3), got dim "
+                  << dSdF.dim());
+   const at::Tensor A = MandelRowsToFull(dSdF);            // (nqp,3,3,3,3)
+   const at::Tensor S_full = MandelVecToFull(S);           // (nqp,3,3)
+   const at::Tensor eye = at::eye(3, F.options());
+   const at::Tensor geometric = at::einsum("ik,bjl->bijkl", {eye, S_full});
+   const at::Tensor material = at::einsum("bim,bmjkl->bijkl", {F, A});
+   return (geometric + material).contiguous();
+}
+
 NEML2StressDivergenceIntegrator::NEML2StressDivergenceIntegrator(
    std::shared_ptr<const ConstitutiveModel> constit, real_t time,
    const IntegrationRule *ir)
     : StressDivergenceIntegrator<NonlinearFormIntegrator>(ir), _t(time),
       _constit_op(std::move(constit))
 {
+   _mode = _constit_op->Mode();
+   const auto &kin = _constit_op->KinematicVars();
+   if (_mode == KinematicMode::SmallStrain)
+   {
+      MFEM_VERIFY(kin.size() == 1 && kin[0].vdim == 6,
+                  "Small-strain kinematics bind exactly one SR2 input; the model "
+                  "declares "
+                     << kin.size() << " kinematic input(s)");
+   }
+   else
+   {
+      MFEM_VERIFY(kin.size() == 1 && kin[0].vdim == 9,
+                  "Deformation-gradient kinematics bind exactly one R2 input; the "
+                  "model declares "
+                     << kin.size() << " kinematic input(s)");
+   }
 }
 
 void NEML2StressDivergenceIntegrator::AssemblePA(const FiniteElementSpace &fe_space)
@@ -55,18 +139,32 @@ void NEML2StressDivergenceIntegrator::AssemblePA(const FiniteElementSpace &fe_sp
 
    _ordering = fe_space.GetOrdering();
    auto *const mesh = fe_space.GetMesh();
-   const auto *const nodes = mesh->GetNodes();
 
    _q_space_symr2 = std::make_unique<UniformParameterSpace>(*mesh,
                                                             *this->IntRule, 6);
-   _strain = std::make_unique<ParameterFunction>(*_q_space_symr2);
-   _strain_lin = std::make_unique<ParameterFunction>(*_q_space_symr2);
-   _stress = std::make_unique<ParameterFunction>(*_q_space_symr2);
+   _q_space_r2 = std::make_unique<UniformParameterSpace>(*mesh, *this->IntRule, 9);
 
-   // Put strain and stress storage on device
-   _strain->UseDevice(true);
-   _strain_lin->UseDevice(true);
+   _stress = std::make_unique<ParameterFunction>(*_q_space_symr2);
+   _pk = std::make_unique<ParameterFunction>(*_q_space_r2);
+   _gradu = std::make_unique<ParameterFunction>(*_q_space_r2);
    _stress->UseDevice(true);
+   _pk->UseDevice(true);
+   _gradu->UseDevice(true);
+
+   // One storage slot per kinematic input the model declares, sized by its base
+   // shape, for both the residual point and the linearization point.
+   for (const auto &kv : _constit_op->KinematicVars())
+   {
+      _kin_spaces.push_back(
+         std::make_unique<UniformParameterSpace>(*mesh, *this->IntRule, kv.vdim));
+      auto &space = *_kin_spaces.back();
+      _kin.push_back(std::make_unique<ParameterFunction>(space));
+      _kin_lin.push_back(std::make_unique<ParameterFunction>(space));
+      _kin.back()->UseDevice(true);
+      _kin_lin.back()->UseDevice(true);
+      _kin_ptrs.push_back(_kin.back().get());
+      _kin_lin_ptrs.push_back(_kin_lin.back().get());
+   }
 }
 
 template <int vdim>
@@ -128,22 +226,130 @@ void NEML2StressDivergenceIntegrator::ComputeStrainImpl(const Vector &x,
                    });
 }
 
-void NEML2StressDivergenceIntegrator::ComputeStrain(const Vector &X,
-                                                    ParameterFunction &strain) const
+template <int vdim>
+void NEML2StressDivergenceIntegrator::ComputeGradUImpl(const Vector &x,
+                                                       bool add_identity,
+                                                       ParameterFunction &gradu)
+                                                                                const
+{
+   constexpr int d = vdim;
+
+   // Assuming all elements are the same
+   const QuadratureInterpolator *E_To_Q_Map = this->fespace->GetQuadratureInterpolator(
+                                                                                   *this->IntRule);
+   E_To_Q_Map->SetOutputLayout(_ordering == Ordering::byNODES ? QVectorLayout::byNODES
+                                                              : QVectorLayout::byVDIM);
+   // The mesh is never moved, so "physical" derivatives are derivatives with
+   // respect to the reference configuration -- exactly what a total-Lagrangian
+   // deformation gradient needs.
+   E_To_Q_Map->PhysDerivatives(x, *this->q_vec);
+
+   const int numPoints = this->IntRule->GetNPoints();
+   const int numEls = this->fespace->GetNE();
+   const auto Q = Reshape(this->q_vec->Read(), numPoints, d, d, numEls);
+   auto G = Reshape(gradu.Write(), 9, numPoints, numEls);
+   mfem::forall_2D(numEls, numPoints, 1,
+                   [=] MFEM_HOST_DEVICE(int e)
+                   {
+                      MFEM_FOREACH_THREAD(p, x, numPoints)
+                      {
+                         // Row-major 3x3, zero-padded out of plane in 2D so the
+                         // (always 3D) NEML2 model sees plane strain.
+                         for (int k = 0; k < 9; ++k) { G(k, p, e) = 0; }
+                         for (int i = 0; i < d; ++i)
+                         {
+                            for (int j = 0; j < d; ++j)
+                            {
+                               G(3 * i + j, p, e) = Q(p, i, j, e);
+                            }
+                         }
+                         if (add_identity)
+                         {
+                            G(0, p, e) += 1;
+                            G(4, p, e) += 1;
+                            G(8, p, e) += 1;
+                         }
+                      }
+                   });
+}
+
+void NEML2StressDivergenceIntegrator::ComputeGradU(const Vector &X,
+                                                   bool add_identity,
+                                                   ParameterFunction &gradu) const
 {
    if (this->vdim == 2)
    {
-      this->ComputeStrainImpl<2>(X, strain);
+      this->ComputeGradUImpl<2>(X, add_identity, gradu);
    }
    else if (this->vdim == 3)
    {
-      this->ComputeStrainImpl<3>(X, strain);
+      this->ComputeGradUImpl<3>(X, add_identity, gradu);
    }
 }
 
+void NEML2StressDivergenceIntegrator::ComputeKinematics(
+   const Vector &X, std::vector<std::unique_ptr<ParameterFunction>> &kin) const
+{
+   if (_mode == KinematicMode::SmallStrain)
+   {
+      if (this->vdim == 2) { this->ComputeStrainImpl<2>(X, *kin[0]); }
+      else if (this->vdim == 3) { this->ComputeStrainImpl<3>(X, *kin[0]); }
+      return;
+   }
+   this->ComputeGradU(X, /*add_identity=*/true, *kin[0]);
+}
+
+void NEML2StressDivergenceIntegrator::ComputePK(
+   const std::vector<std::unique_ptr<ParameterFunction>> &kin) const
+{
+   const int npts = _stress->Size() / 6;
+   const auto S = Reshape(_stress->Read(), 6, npts);
+   auto T = Reshape(_pk->Write(), 9, npts);
+   const bool finite_deformation = (_mode == KinematicMode::DeformationGradient);
+   // A deformation gradient is present only in the finite-deformation branch;
+   // alias the stress otherwise so the (unused) pointer is still valid.
+   const auto F = Reshape(
+      finite_deformation ? kin[0]->Read() : _stress->Read(), 9, npts);
+
+   mfem::forall(npts,
+                [=] MFEM_HOST_DEVICE(int p)
+                {
+                   constexpr real_t sqrt2 = 1.4142135623730951_r;
+                   // Mandel SR2 -> row-major 3x3.
+                   real_t Sf[9];
+                   Sf[0] = S(0, p);
+                   Sf[4] = S(1, p);
+                   Sf[8] = S(2, p);
+                   Sf[5] = Sf[7] = S(3, p) / sqrt2;
+                   Sf[2] = Sf[6] = S(4, p) / sqrt2;
+                   Sf[1] = Sf[3] = S(5, p) / sqrt2;
+
+                   if (!finite_deformation)
+                   {
+                      // Small strain: the model's Cauchy stress is already the
+                      // stress conjugate to the reference gradient.
+                      for (int k = 0; k < 9; ++k) { T(k, p) = Sf[k]; }
+                      return;
+                   }
+                   // P = F S
+                   for (int i = 0; i < 3; ++i)
+                   {
+                      for (int j = 0; j < 3; ++j)
+                      {
+                         real_t sum = 0;
+                         for (int m = 0; m < 3; ++m)
+                         {
+                            sum += F(3 * i + m, p) * Sf[3 * m + j];
+                         }
+                         T(3 * i + j, p) = sum;
+                      }
+                   }
+                });
+}
+
 template <int vdim>
-void NEML2StressDivergenceIntegrator::ComputeRImpl(const ParameterFunction &stress,
-                                                   Vector &R) const
+void NEML2StressDivergenceIntegrator::ComputeDivergenceImpl(
+   const ParameterFunction &pk, Vector &R) const
 {
    using future::det;
    using future::inv;
@@ -155,36 +361,31 @@ void NEML2StressDivergenceIntegrator::ComputeRImpl(const ParameterFunction &stre
    const int numPoints = this->IntRule->GetNPoints();
    const int numEls = this->fespace->GetNE();
    auto Q = Reshape(this->q_vec->Write(), numPoints, d, d, numEls);
-   // device stress
-   const auto dStress = Reshape(stress.Read(), 6, numPoints, numEls);
+   const auto dPK = Reshape(pk.Read(), 9, numPoints, numEls);
    const auto J = Reshape(this->geom->J.Read(), numPoints, d, d, numEls);
 
    const real_t *ipWeights = this->IntRule->GetWeights().Read();
    mfem::forall_2D(numEls, numPoints, 1,
                    [=] MFEM_HOST_DEVICE(int e)
                    {
-                      // for(int p = 0; p < numPoints, )
                       MFEM_FOREACH_THREAD(p, x, numPoints)
                       {
                          // clang-format off
                            const auto invJ = inv(make_tensor<d, d>([&](int i, int j)
                                                                   { return J(p, i, j, e); }));
                          // clang-format on
-                         constexpr real_t sqrt2 = 1.4142135623730951_r;
                          tensor<real_t, d, d> stress_tensor;
-                         stress_tensor(0, 0) = dStress(0, p, e);
-                         stress_tensor(1, 1) = dStress(1, p, e);
-                         stress_tensor(0, 1) = dStress(5, p, e) / sqrt2;
-                         stress_tensor(1, 0) = stress_tensor(0, 1);
-                         if (d == 3)
+                         for (int i = 0; i < d; ++i)
                          {
-                            stress_tensor(2, 2) = dStress(2, p, e);
-                            stress_tensor(1, 2) = dStress(3, p, e) / sqrt2;
-                            stress_tensor(0, 2) = dStress(4, p, e) / sqrt2;
-                            stress_tensor(2, 1) = stress_tensor(1, 2);
-                            stress_tensor(2, 0) = stress_tensor(0, 2);
+                            for (int j = 0; j < d; ++j)
+                            {
+                               stress_tensor(i, j) = dPK(3 * i + j, p, e);
+                            }
                          }
                          const auto JxW = ipWeights[p] / det(invJ);
+                         // Fold the inverse Jacobian into the stress so the
+                         // reduction below can contract against reference-frame
+                         // shape function gradients directly.
                          const auto sigma_ref_weighted = stress_tensor *
                                                          transpose(invJ) * JxW;
                          for (int m = 0; m < d; ++m)
@@ -223,16 +424,16 @@ void NEML2StressDivergenceIntegrator::ComputeRImpl(const ParameterFunction &stre
                    });
 }
 
-void NEML2StressDivergenceIntegrator::ComputeR(const ParameterFunction &stress,
-                                               Vector &R) const
+void NEML2StressDivergenceIntegrator::ComputeDivergence(const ParameterFunction &pk,
+                                                        Vector &R) const
 {
    if (this->vdim == 2)
    {
-      this->ComputeRImpl<2>(stress, R);
+      this->ComputeDivergenceImpl<2>(pk, R);
    }
    else if (this->vdim == 3)
    {
-      this->ComputeRImpl<3>(stress, R);
+      this->ComputeDivergenceImpl<3>(pk, R);
    }
 }
 
@@ -241,27 +442,28 @@ void NEML2StressDivergenceIntegrator::AddMultPA(const Vector &X,
 {
    MFEM_VERIFY(_state, "NEML2StressDivergenceIntegrator: SetState() not called");
 
-   // displacement -> strain
-   this->ComputeStrain(X, *_strain);
+   // displacement -> kinematics
+   this->ComputeKinematics(X, _kin);
 
-   // strain -> stress via NEML2 (reads old history, stages new state)
+   // kinematics -> stress via NEML2 (reads old history, stages new state)
    if (s_profile)
    {
       StopWatch sw;
       DeviceSyncIfGPU();
       sw.Start();
-      _constit_op->Mult(*_strain, *_stress, _t, *_state);
+      _constit_op->Mult(_kin_ptrs, *_stress, _t, *_state);
       DeviceSyncIfGPU();
       sw.Stop();
       s_residual_time += sw.RealTime();
    }
    else
    {
-      _constit_op->Mult(*_strain, *_stress, _t, *_state);
-   }
+      _constit_op->Mult(_kin_ptrs, *_stress, _t, *_state);
+    }
 
    // stress -> residuals
-   this->ComputeR(*_stress, R);
+   this->ComputePK(_kin);
+   this->ComputeDivergence(*_pk, R);
 }
 
 void NEML2StressDivergenceIntegrator::AssembleGradPA(const Vector &X,
@@ -272,35 +474,45 @@ void NEML2StressDivergenceIntegrator::AssembleGradPA(const Vector &X,
 
    MFEM_VERIFY(_state, "NEML2StressDivergenceIntegrator: SetState() not called");
 
-   // Evaluate the consistent tangent once at this linearization strain and cache
-   // it in two forms sharing the single NEML2 solve: the Mandel 6x6 block (used
-   // by the matrix-free gradient action in AddMultGradPA) and the full C_ijkl
-   // (used by the assembled paths: PA diagonal, element assembly, coarse matrix).
-   this->ComputeStrain(X, *_strain_lin);
-   if (!_tangent.has_value())
-   {
-      _tangent.emplace();
-   }
-   if (!_mandel_tangent.has_value())
-   {
-      _mandel_tangent.emplace();
-   }
+   // Evaluate the consistent tangent once at this linearization point and cache
+   // it in two forms sharing the single NEML2 solve: the full D_iJkL (used by the
+   // assembled paths: PA diagonal, element assembly, coarse matrix) and its
+   // (9,9) flattening (used by the matrix-free gradient action).
+   this->ComputeKinematics(X, _kin_lin);
+   std::vector<at::Tensor> blocks;
    if (s_profile)
    {
       StopWatch sw;
       DeviceSyncIfGPU();
       sw.Start();
-      _constit_op->Tangent(*_strain_lin, _mandel_tangent.value(),
-                           _tangent.value(), _t, *_state);
+      _constit_op->Tangent(_kin_lin_ptrs, blocks, *_stress, _t, *_state);
       DeviceSyncIfGPU();
       sw.Stop();
       s_tangent_time += sw.RealTime();
    }
    else
    {
-      _constit_op->Tangent(*_strain_lin, _mandel_tangent.value(),
-                           _tangent.value(), _t, *_state);
+      _constit_op->Tangent(_kin_lin_ptrs, blocks, *_stress, _t, *_state);
    }
+
+   if (_mode == KinematicMode::SmallStrain)
+   {
+      // d(sigma)/d(grad u) is the small-strain stiffness itself: the symmetrizing
+      // half-factors sum away against C's minor symmetry.
+      _tangent = ConstitutiveModel::MandelToFullStiffness(blocks[0]);
+   }
+   else
+   {
+      const auto opts = _constit_op->Options();
+      const at::Tensor S = ConstitutiveModel::Wrap(opts, *_stress);
+      const at::Tensor F = ConstitutiveModel::Wrap(opts, *_kin_lin[0])
+                              .reshape({-1, 3, 3});
+      _tangent = DeformationGradientTangent(blocks[0], S, F);
+   }
+
+   const at::Tensor &D = _tangent.value();
+   _flat_tangent = (D.dim() > 4) ? D.reshape({D.size(0), 9, 9})
+                                 : D.reshape({9, 9});
 }
 
 template <int vdim>
@@ -320,21 +532,16 @@ void NEML2StressDivergenceIntegrator::AssembleGradDiagonalPAImpl(Vector &diag) c
    const auto G = Reshape(this->maps->G.Read(), numPoints, d, nDofs);
    auto diagDev = Reshape(diag.Write(), nDofs, d, numEls);
    const real_t *ipWeights = this->IntRule->GetWeights().Read();
-   // Full 3x3x3x3 stiffness C_ijkl from the NEML2 jacobian; unbatched (dim()==4)
-   // when the derivative is batch-independent (e.g. linear elasticity).
+   // The tangent D_iJkL; unbatched (dim()==4) when the derivative is
+   // batch-independent (e.g. linear elasticity).
    const at::Tensor &full_tangent = _tangent.value();
    const bool constant_tangent = (full_tangent.dim() == 4);
    const int tangent_qp_size = constant_tangent ? 1 : numPoints;
    const int tangent_elem_size = constant_tangent ? 1 : numEls;
-   const auto C = Reshape(full_tangent.data_ptr<real_t>(), 3, 3, 3, 3,
-                          tangent_qp_size, tangent_elem_size);
-
-   // Index dictionary
-   // m: Directional derivatives
-   // a, b, c, d: Vector components for strain, stress
-   // c, d: Vector/tensor components for stress -> tangent C_abcd
-   // IVec: element-wise vector test function
-   //
+   // MFEM's Reshape indexes leftmost-fastest while the torch tensor is row-major,
+   // so the four tensor slots appear reversed: Craw(L,k,J,i) is D_iJkL.
+   const auto Craw = Reshape(full_tangent.data_ptr<real_t>(), 3, 3, 3, 3,
+                             tangent_qp_size, tangent_elem_size);
 
    // clang-format off
    mfem::forall_2D(numEls, nDofs, d,
@@ -368,46 +575,19 @@ void NEML2StressDivergenceIntegrator::AssembleGradDiagonalPAImpl(Vector &diag) c
                                   }
                                }
 
-                               // Build strain tensor for vector basis functions
-                               // Recall that we are doing the diagonal here so normally
-                               // I'd write this as epsJ but here we write as epsI
-                               real_t epsI[d][d];
-                               for (int a = 0; a < d; ++a)
-                               {
-                                  for (int m = 0; m < d; ++m)
-                                  {
-                                     epsI[a][m] = 0.;
-                                  }
-                               }
-
-                               for (int m = 0; m < d; ++m)
-                               {
-                                  // Leverage symmetry for the strain
-                                  const auto dphiI_dm = dphiI[m];
-                                  epsI[ic][m] += 0.5 * dphiI_dm;
-                                  epsI[m][ic] += 0.5 * dphiI_dm;
-                               }
-
-                               // Contract strain tensors with tangent
-                               // gradI_ab * C_abcd * epsJ_cd
+                               // K_(I,ic)(I,ic) = dphiI_J D_(ic)J(ic)L dphiI_L.
+                               // The diagonal is the I==J, ic==jc case of the
+                               // element matrix below.
                                real_t val = 0.;
-                               for (int a = 0; a < d; ++a)
+                               for (int Jd = 0; Jd < d; ++Jd)
                                {
-                                  for (int c = 0; c < d; ++c)
+                                  for (int L = 0; L < d; ++L)
                                   {
-                                     for (int dd = 0; dd < d; ++dd)
-                                     {
-                                        // NEML2 is row major with rows corresponding to stress
-                                        // components and columns corresponding to strain
-                                        // components. Recall that MFEM tensors have the leftmost
-                                        // index as contiguous
-                                        const auto Cval = C(c, dd, a, ic,
-                                                            tangent_p_index,
-                                                            tangent_e_index);
-                                        const auto g = dphiI[a];
-                                        const auto e = epsI[c][dd];
-                                        val += g * Cval * e;
-                                     }
+                                     val += dphiI[Jd] *
+                                            Craw(L, ic, Jd, ic,
+                                                 tangent_p_index,
+                                                 tangent_e_index) *
+                                            dphiI[L];
                                   }
                                }
                                sum += w * val;
@@ -449,22 +629,16 @@ void NEML2StressDivergenceIntegrator::AssembleGradEAImpl(Vector &emat)
    const auto G = Reshape(this->maps->G.Read(), numPoints, d, nDofs);
    auto ematDev = Reshape(emat.Write(), vDofs, vDofs, numEls);
    const real_t *ipWeights = this->IntRule->GetWeights().Read();
-   // Full 3x3x3x3 stiffness C_ijkl from the NEML2 jacobian; unbatched (dim()==4)
-   // when the derivative is batch-independent (e.g. linear elasticity).
+   // The tangent D_iJkL; unbatched (dim()==4) when the derivative is
+   // batch-independent (e.g. linear elasticity).
    const at::Tensor &full_tangent = _tangent.value();
    const bool constant_tangent = (full_tangent.dim() == 4);
    const int tangent_qp_size = constant_tangent ? 1 : numPoints;
    const int tangent_elem_size = constant_tangent ? 1 : numEls;
-   const auto C = Reshape(full_tangent.data_ptr<real_t>(), 3, 3, 3, 3,
-                          tangent_qp_size, tangent_elem_size);
-
-   // Index dictionary
-   // m: Directional derivatives
-   // a, b, c, d: Vector components for strain, stress
-   // c, d: Vector/tensor components for stress -> tangent C_abcd
-   // IVec: element-wise vector test function
-   // JVec: element-wise vector trial function
-   //
+   // MFEM's Reshape indexes leftmost-fastest while the torch tensor is row-major,
+   // so the four tensor slots appear reversed: Craw(L,k,J,i) is D_iJkL.
+   const auto Craw = Reshape(full_tangent.data_ptr<real_t>(), 3, 3, 3, 3,
+                             tangent_qp_size, tangent_elem_size);
 
    // clang-format off
    mfem::forall_2D(numEls, vDofs, vDofs,
@@ -509,44 +683,20 @@ void NEML2StressDivergenceIntegrator::AssembleGradEAImpl(Vector &emat)
                                   }
                                }
 
-                               // Build strain tensor for vector basis functions
-                               real_t epsJ[d][d];
-                               for (int a = 0; a < d; ++a)
-                               {
-                                  for (int m = 0; m < d; ++m)
-                                  {
-                                     epsJ[a][m] = 0.;
-                                  }
-                               }
-
-                               for (int m = 0; m < d; ++m)
-                               {
-                                  // Leverage symmetry for the strain
-                                  const auto dphiJ_dm = dphiJ[m];
-                                  epsJ[jc][m] += 0.5 * dphiJ_dm;
-                                  epsJ[m][jc] += 0.5 * dphiJ_dm;
-                               }
-
-                               // Contract strain tensors with tangent
-                               // gradI_ab * C_abcd * epsJ_cd
+                               // K_(I,ic)(J,jc) = dphiI_Jd D_(ic)(Jd)(jc)L dphiJ_L.
+                               // Contracted in this explicit order because the
+                               // finite-deformation tangent has neither minor nor
+                               // major symmetry to fall back on.
                                real_t val = 0.;
-                               for (int a = 0; a < d; ++a)
+                               for (int Jd = 0; Jd < d; ++Jd)
                                {
-                                  for (int c = 0; c < d; ++c)
+                                  for (int L = 0; L < d; ++L)
                                   {
-                                     for (int dd = 0; dd < d; ++dd)
-                                     {
-                                        // NEML2 is row major with rows corresponding to stress
-                                        // components and columns corresponding to strain
-                                        // components. Recall that MFEM tensors have the leftmost
-                                        // index as contiguous
-                                        const auto Cval = C(c, dd, a, ic,
-                                                            tangent_p_index,
-                                                            tangent_e_index);
-                                        const auto g = dphiI[a];
-                                        const auto e = epsJ[c][dd];
-                                        val += g * Cval * e;
-                                     }
+                                     val += dphiI[Jd] *
+                                            Craw(L, jc, Jd, ic,
+                                                 tangent_p_index,
+                                                 tangent_e_index) *
+                                            dphiJ[L];
                                   }
                                }
                                sum += w * val;
@@ -576,18 +726,18 @@ void NEML2StressDivergenceIntegrator::AssembleGradEA(const Vector &X,
 void NEML2StressDivergenceIntegrator::AddMultGradPA(const Vector &dX,
                                                     Vector &dR) const
 {
-   MFEM_VERIFY(_mandel_tangent.has_value(),
+   MFEM_VERIFY(_flat_tangent.has_value(),
                "AssembleGradPA must run before AddMultGradPA");
 
-   // dε = strain_op(dX)
-   this->ComputeStrain(dX, *_strain);
+   // grad(du) at the quadrature points (no identity: this is an increment)
+   this->ComputeGradU(dX, /*add_identity=*/false, *_gradu);
 
-   // dσ = C : dε  (contract the tangent cached at this linearization -- a 6x6
-   // Mandel matvec per qp, no constitutive re-evaluation)
-   _constit_op->ApplyStoredTangent(_mandel_tangent.value(), *_strain, *_stress);
+   // dT = D : grad(du), the cached consistent-tangent action as a per-point 9x9
+   // matvec -- no constitutive re-evaluation.
+   _constit_op->ApplyStoredTangent(_flat_tangent.value(), *_gradu, *_pk);
 
-   // dR = stressdiv_op(dσ)
-   this->ComputeR(*_stress, dR);
+   // dR = div(dT)
+   this->ComputeDivergence(*_pk, dR);
 }
 
 template void
@@ -599,11 +749,19 @@ NEML2StressDivergenceIntegrator::ComputeStrainImpl<3>(const Vector &x,
                                                       ParameterFunction &strain)
                                                                                 const;
 template void
-NEML2StressDivergenceIntegrator::ComputeRImpl<2>(const ParameterFunction &stress,
-                                                 Vector &R) const;
+NEML2StressDivergenceIntegrator::ComputeGradUImpl<2>(const Vector &x,
+                                                     bool add_identity,
+                                                     ParameterFunction &gradu) const;
 template void
-NEML2StressDivergenceIntegrator::ComputeRImpl<3>(const ParameterFunction &stress,
-                                                 Vector &R) const;
+NEML2StressDivergenceIntegrator::ComputeGradUImpl<3>(const Vector &x,
+                                                     bool add_identity,
+                                                     ParameterFunction &gradu) const;
+template void
+NEML2StressDivergenceIntegrator::ComputeDivergenceImpl<2>(const ParameterFunction &pk,
+                                                          Vector &R) const;
+template void
+NEML2StressDivergenceIntegrator::ComputeDivergenceImpl<3>(const ParameterFunction &pk,
+                                                          Vector &R) const;
 template void
 NEML2StressDivergenceIntegrator::AssembleGradEAImpl<2>(Vector &emat);
 template void

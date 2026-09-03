@@ -39,8 +39,14 @@
 #include "neml2/csrc/dispatchers/SimpleScheduler.h"
 #include "neml2/csrc/dispatchers/factory.h"
 
+#include <array>
+#include <cmath>
 #include <filesystem>
+#include <limits>
+#include <map>
 #include <memory>
+#include <random>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -170,6 +176,12 @@ class NEML2Multigrid : public GeometricMultigrid
       coarser_solutions.resize(num_coarser_levels);
       if (num_coarser_levels)
       {
+         // NOTE: this transfers the linearization point down the hierarchy with
+         // P^T, which is the restriction for residuals rather than for
+         // solutions. Coarse levels consequently linearize somewhere the fine
+         // level never visits -- see the "coarse-level linearization point"
+         // entry in physics/cpfe/PLAN.md, which is an open investigation, not a
+         // settled diagnosis.
          auto create_coarser_solution = [this](const int level,
                                                const Vector &finer_solution)
          {
@@ -410,6 +422,119 @@ class NEML2MultigridPreconditionerFactory : public PetscPreconditionerFactory
    const Vector &fine_solution;
 };
 
+// Split a comma-separated option value, dropping empty entries.
+static std::vector<std::string> SplitList(const std::string &s)
+{
+   std::vector<std::string> out;
+   std::string item;
+   std::istringstream stream(s);
+   while (std::getline(stream, item, ','))
+   {
+      if (!item.empty()) { out.push_back(item); }
+   }
+   return out;
+}
+
+// Parse `--initial-conditions`: comma-separated `base=spec`, where spec is
+// `identity` or a numeric constant applied to every component.
+static std::map<std::string, InitialCondition>
+ParseInitialConditions(const std::string &spec)
+{
+   std::map<std::string, InitialCondition> ics;
+   for (const auto &entry : SplitList(spec))
+   {
+      const auto eq = entry.find('=');
+      MFEM_VERIFY(eq != std::string::npos && eq > 0,
+                  "Malformed initial condition '"
+                     << entry << "'; expected <base>=<spec>");
+      const std::string base = entry.substr(0, eq);
+      const std::string value = entry.substr(eq + 1);
+      ics[base] = (value == "identity") ? InitialCondition::Identity()
+                                        : InitialCondition::Constant(
+                                             std::stod(value));
+   }
+   return ics;
+}
+
+// Fill a per-quadrature-point orientation field for an ad hoc polycrystal.
+//
+// Grains come from a Voronoi tessellation of `num_grains` random seed points:
+// every quadrature point takes the orientation of its nearest seed. That makes
+// grain boundaries voxelized rather than conforming to element faces -- adequate
+// to exercise the crystal plasticity coupling and grow a texture, but not a
+// substitute for the conforming polycrystal mesher tracked in
+// physics/cpfe/PLAN.md.
+//
+// Orientations are Modified Rodrigues Parameters (NEML2's `Rot`), drawn by
+// sampling uniform unit quaternions (Shoemake) and mapping q -> MRP so the
+// resulting texture is uniform over SO(3) rather than biased toward small
+// rotations.
+static void FillRandomGrainOrientations(const FiniteElementSpace &fes,
+                                        int num_grains, int seed,
+                                        ParameterFunction &orientation)
+{
+   Mesh &mesh = *fes.GetMesh();
+   const int dim = mesh.Dimension();
+
+   // Seed points in the mesh bounding box, plus one orientation per grain. Every
+   // rank draws the same sequence from the same seed, so grains agree across
+   // ranks and across multigrid levels without communication.
+   std::mt19937 rng(seed);
+   std::uniform_real_distribution<real_t> unit(0.0, 1.0);
+
+   Vector lo, hi;
+   mesh.GetBoundingBox(lo, hi);
+   std::vector<Vector> seeds(num_grains, Vector(dim));
+   for (auto &s : seeds)
+   {
+      for (int d = 0; d < dim; ++d) { s(d) = lo(d) + unit(rng) * (hi(d) - lo(d)); }
+   }
+
+   std::vector<std::array<real_t, 3>> mrp(num_grains);
+   for (auto &r : mrp)
+   {
+      // Shoemake's uniform unit quaternion.
+      const real_t u1 = unit(rng), u2 = unit(rng), u3 = unit(rng);
+      const real_t s1 = std::sqrt(1 - u1), s2 = std::sqrt(u1);
+      const real_t two_pi = 2 * M_PI;
+      real_t q[4] = {s2 * std::cos(two_pi * u3), // w
+                     s1 * std::sin(two_pi * u2), s1 * std::cos(two_pi * u2),
+                     s2 * std::sin(two_pi * u3)};
+      // MRP = q_vec / (1 + q_w); flip to the shadow parameters when q_w < 0 to
+      // stay on the bounded branch (|MRP| <= 1).
+      if (q[0] < 0)
+      {
+         for (auto &c : q) { c = -c; }
+      }
+      const real_t den = 1 + q[0];
+      r = {q[1] / den, q[2] / den, q[3] / den};
+   }
+
+   const IntegrationRule &ir = NEML2IntRule(fes);
+   const int nqp = ir.GetNPoints();
+   real_t *data = orientation.HostWrite();
+   Vector xq(dim);
+
+   for (int e = 0; e < mesh.GetNE(); ++e)
+   {
+      ElementTransformation &T = *mesh.GetElementTransformation(e);
+      for (int p = 0; p < nqp; ++p)
+      {
+         T.SetIntPoint(&ir.IntPoint(p));
+         T.Transform(ir.IntPoint(p), xq);
+         int nearest = 0;
+         real_t best = std::numeric_limits<real_t>::max();
+         for (int g = 0; g < num_grains; ++g)
+         {
+            const real_t d2 = xq.DistanceSquaredTo(seeds[g]);
+            if (d2 < best) { best = d2; nearest = g; }
+         }
+         real_t *dst = data + 3 * (e * nqp + p);
+         for (int c = 0; c < 3; ++c) { dst[c] = mrp[nearest][c]; }
+      }
+   }
+}
+
 int main(int argc, char *argv[])
 {
    // Initialize MPI and HYPRE
@@ -438,9 +563,15 @@ int main(int argc, char *argv[])
    int nt = 5;
    real_t dt = 0.01;
    real_t umax = 0.001;
-   std::string strain_var = "strain";
+   std::string kinematics = "small_strain";
+   std::string kinematic_vars = "";
    std::string stress_var = "stress";
    std::string time_var = "t";
+   std::string field_vars = "";
+   std::string ic_spec = "";
+   std::string orientation_var = "";
+   int num_grains = 0;
+   int grain_seed = 42;
 
    OptionsParser args(argc, argv);
    args.AddOption(&device_config, "-d", "--device",
@@ -470,13 +601,41 @@ int main(int argc, char *argv[])
    args.AddOption(&umax, "-umax", "--max-displacement",
                   "Total prescribed displacement at the final step; ramped "
                   "uniformly over the load steps.");
-   args.AddOption(&strain_var, "-sv", "--strain-var",
-                  "Name of the FE-driven strain input in the NEML2 model.");
+   args.AddOption(&kinematics, "-kin", "--kinematics",
+                  "Kinematic measure the FE side feeds the model: small_strain "
+                  "(sym(grad u), Mandel SR2; stress output is Cauchy) | "
+                  "deformation_gradient (F = I + grad u, row-major R2; stress "
+                  "output is PK2).");
+   args.AddOption(&kinematic_vars, "-kv", "--kinematic-vars",
+                  "Comma-separated NEML2 input names to drive with the "
+                  "kinematic quantities, in order. Defaults to 'strain' for "
+                  "small_strain and 'F' for deformation_gradient.");
    args.AddOption(&stress_var, "-yv", "--stress-var",
                   "Name of the stress output in the NEML2 model.");
    args.AddOption(&time_var, "-tv", "--time-var",
                   "Name of the time input in the NEML2 model (ignored if the "
                   "model declares no such input).");
+   args.AddOption(&field_vars, "-fv", "--field-vars",
+                  "Comma-separated NEML2 inputs supplied as per-quadrature-point "
+                  "fields held fixed over the run (e.g. 'r' for crystal "
+                  "orientation). Any declared input that is not kinematic, the "
+                  "time, or ~k-lagged must be listed here.");
+   args.AddOption(&ic_spec, "-ic", "--initial-conditions",
+                  "Comma-separated <base>=<spec> initial conditions for state "
+                  "variables, where <spec> is 'identity', or a numeric constant "
+                  "applied to every component (e.g. 'Fp=identity,tauc=50'). "
+                  "Unlisted state variables start at zero.");
+   args.AddOption(&orientation_var, "-ov", "--orientation-var",
+                  "Prescribed field (from --field-vars) to fill with a random "
+                  "per-grain orientation. Requires --num-grains.");
+   args.AddOption(&num_grains, "-ng", "--num-grains",
+                  "Number of grains in the ad hoc polycrystal: element centers "
+                  "are assigned to the nearest of this many random seed points "
+                  "and each grain draws one random orientation. Grain "
+                  "boundaries are voxelized, not conforming -- see "
+                  "physics/cpfe/PLAN.md.");
+   args.AddOption(&grain_seed, "-gs", "--grain-seed",
+                  "RNG seed for grain seed points and orientations.");
    bool profile = false;
    args.AddOption(&profile, "-prof", "--profile", "-no-prof", "--no-profile",
                   "Report per-step constitutive vs linear-solve time and "
@@ -605,20 +764,54 @@ int main(int argc, char *argv[])
          neml2::aoti::load_model(artifact_path, neml2_model, scheduler));
    }
 
-   // Model-agnostic constitutive wrapper: classifies the model's declared I/O
-   // into the FE-driven strain input, the stress output, the time input, and the
+   // Bind the driver's roles to this model's declared variable names. Everything
+   // model-specific about the coupling lives in this struct, so one build drives
+   // small-strain, finite-deformation and crystal plasticity models alike.
+   VariableBinding binding;
+   MFEM_VERIFY(kinematics == "small_strain" ||
+                  kinematics == "deformation_gradient",
+               "Unknown --kinematics '" << kinematics << "'");
+   binding.mode = (kinematics == "deformation_gradient")
+                     ? KinematicMode::DeformationGradient
+                     : KinematicMode::SmallStrain;
+   binding.kinematics = SplitList(kinematic_vars);
+   if (binding.kinematics.empty())
+   {
+      binding.kinematics = {
+         binding.mode == KinematicMode::DeformationGradient ? "F" : "strain"};
+   }
+   binding.stress = stress_var;
+   binding.time = time_var;
+   binding.fields = SplitList(field_vars);
+   binding.initial_conditions = ParseInitialConditions(ic_spec);
+
+   // Classifies the model's declared I/O into the FE-driven kinematic inputs,
+   // the stress output, the time input, the prescribed per-point fields, and the
    // generic `~k`-lagged history variables. Shared (read-only) across the top
    // form and every multigrid level.
-   auto constit = std::make_shared<const ConstitutiveModel>(cmodel, strain_var,
-                                                            stress_var, time_var);
+   auto constit = std::make_shared<const ConstitutiveModel>(cmodel, binding);
    if (myid == 0)
    {
-      std::cout << "NEML2 model: strain='" << constit->StrainName()
-                << "' stress='" << constit->StressName() << "' time='"
-                << constit->TimeName() << "' history variables:";
+      std::cout << "NEML2 model: kinematics(" << kinematics << ")=";
+      for (const auto &v : constit->KinematicVars())
+      {
+         std::cout << '\'' << v.name << "'(vdim=" << v.vdim << ')';
+      }
+      std::cout << " stress='" << constit->StressName() << "' time='"
+                << constit->TimeName() << "'";
+      if (!constit->FieldVars().empty())
+      {
+         std::cout << " fields:";
+         for (const auto &v : constit->FieldVars())
+         {
+            std::cout << ' ' << v.name << "(vdim=" << v.vdim << ')';
+         }
+      }
+      std::cout << " history variables:";
       for (const auto &v : constit->StateVars())
       {
-         std::cout << ' ' << v.base << "(vdim=" << v.vdim << ')';
+         std::cout << ' ' << v.var.base << "(vdim=" << v.var.vdim << ",~"
+                   << v.depth << ')';
       }
       if (!constit->HasState())
       {
@@ -637,9 +830,26 @@ int main(int argc, char *argv[])
    level_states.reserve(num_levels);
    for (int level = 0; level < num_levels; ++level)
    {
+      const FiniteElementSpace &level_fes = fespaces.GetFESpaceAtLevel(level);
       level_states.push_back(std::make_unique<MaterialStateManager>(
-         fespaces.GetFESpaceAtLevel(level), constit->StateVars()));
+         level_fes, constit->StateVars(), constit->FieldVars()));
       level_state_ptrs.push_back(level_states[level].get());
+
+      // Seed the prescribed orientation field on this level's own quadrature
+      // points. Each level resolves the same grain geometry at its own
+      // resolution, so coarse levels see a consistent (if blockier) texture.
+      if (!orientation_var.empty())
+      {
+         MFEM_VERIFY(num_grains > 0,
+                     "--orientation-var requires --num-grains > 0");
+         MFEM_VERIFY(level_states[level]->HasField(orientation_var),
+                     "--orientation-var '"
+                        << orientation_var
+                        << "' is not among --field-vars, so the model does not "
+                           "declare it as a prescribed input");
+         FillRandomGrainOrientations(level_fes, num_grains, grain_seed,
+                                     level_states[level]->Field(orientation_var));
+      }
    }
    MaterialStateManager &fine_state = *level_states.back();
 
@@ -809,9 +1019,9 @@ int main(int argc, char *argv[])
             }
             for (const auto &v : constit->StateVars())
             {
-               ParameterFunction &s = level_state_ptrs[lvl]->Old(v.base);
+               ParameterFunction &s = level_state_ptrs[lvl]->Old(v.var.base);
                const real_t nrm = std::sqrt(InnerProduct(comm, s, s));
-               if (myid == 0) { std::cout << ' ' << v.base << '=' << nrm; }
+               if (myid == 0) { std::cout << ' ' << v.var.base << '=' << nrm; }
             }
             if (myid == 0) { std::cout << std::endl; }
          }
